@@ -23,6 +23,8 @@
 #include <xen/errno.h>
 #include <xen/keyhandler.h>
 #include <xen/trace.h>
+// for get_random
+#include <xen/random.h>
 
 
 /*
@@ -1613,6 +1615,473 @@ csched_load_balance(struct csched_private *prv, int cpu,
     return snext;
 }
 
+
+// Li
+// from local runq, find a vCPU of highest priority, in random
+static struct csched_vcpu *
+csched_snext_pick_local_random(struct list_head * const runq)
+{
+    struct csched_vcpu *snext, *speer;
+    struct list_head *iter;
+    int count = 0;
+
+    // count all vCPUs of highest priority
+    snext = __runq_elem(runq->next);
+    list_for_each( iter, runq )
+        {
+            speer = __runq_elem(iter);
+            if ( speer->pri < snext->pri )
+                break;
+            count++;
+        }
+
+    // pick a vCPU of highest priority at equal probability
+    count = get_random() % count;
+    list_for_each( iter, runq )
+        {
+            speer = __runq_elem(iter);
+            if (count == 0)
+                return speer;
+            count--;
+        }
+    return snext;
+}
+
+
+// Li
+// from remote runq, find the first vCPU of priority higher than "pri", in order
+// for now, same as csched__runq_steal
+static struct csched_vcpu *
+csched_runq_steal_order(int peer_cpu, int cpu, int pri, int balance_step)
+{
+    const struct csched_pcpu * const peer_pcpu = CSCHED_PCPU(peer_cpu);
+    const struct vcpu * const peer_vcpu = curr_on_cpu(peer_cpu);
+    struct csched_vcpu *speer;
+    struct list_head *iter;
+    struct vcpu *vc;
+
+    /*
+     * Don't steal from an idle CPU's runq because it's about to
+     * pick up work from it itself.
+     */
+    if ( peer_pcpu != NULL && !is_idle_vcpu(peer_vcpu) )
+    {
+        list_for_each( iter, &peer_pcpu->runq )
+        {
+            speer = __runq_elem(iter);
+
+            /*
+             * If next available VCPU here is not of strictly higher
+             * priority than ours, this PCPU is useless to us.
+             */
+            if ( speer->pri <= pri )
+                break;
+
+            /* Is this VCPU runnable on our PCPU? */
+            vc = speer->vcpu;
+            BUG_ON( is_idle_vcpu(vc) );
+
+            /*
+             * If the vcpu has no useful soft affinity, skip this vcpu.
+             * In fact, what we want is to check if we have any "soft-affine
+             * work" to steal, before starting to look at "hard-affine work".
+             *
+             * Notice that, if not even one vCPU on this runq has a useful
+             * soft affinity, we could have avoid considering this runq for
+             * a soft balancing step in the first place. This, for instance,
+             * can be implemented by taking note of on what runq there are
+             * vCPUs with useful soft affinities in some sort of bitmap
+             * or counter.
+             */
+            if ( balance_step == CSCHED_BALANCE_SOFT_AFFINITY
+                 && !__vcpu_has_soft_affinity(vc, vc->cpu_hard_affinity) )
+                continue;
+
+            csched_balance_cpumask(vc, balance_step, csched_balance_mask(cpu));
+            if ( __csched_vcpu_is_migrateable(vc, cpu,
+                                              csched_balance_mask(cpu)) )
+            {
+                /* We got a candidate. Grab it! */
+                TRACE_3D(TRC_CSCHED_STOLEN_VCPU, peer_cpu,
+                         vc->domain->domain_id, vc->vcpu_id);
+                SCHED_VCPU_STAT_CRANK(speer, migrate_q);
+                SCHED_STAT_CRANK(migrate_queued);
+                WARN_ON(vc->is_urgent);
+                __runq_remove(speer);
+                vc->processor = cpu;
+                return speer;
+            }
+        }
+    }
+
+    SCHED_STAT_CRANK(steal_peer_idle);
+    return NULL;
+}
+
+
+// Li
+// from remote runq, find the first vCPU of priority higher than "pri", in random
+// modified version of csched_runq_steal above
+static struct csched_vcpu *
+csched_runq_steal_random(int peer_cpu, int cpu, int pri, int balance_step )
+{
+    const struct csched_pcpu * const peer_pcpu = CSCHED_PCPU(peer_cpu);
+    const struct vcpu * const peer_vcpu = curr_on_cpu(peer_cpu);
+    struct csched_vcpu *speer;
+    struct list_head *iter;
+    struct vcpu *vc;
+    // for random number
+    int count = 0;
+
+    /*
+     * Don't steal from an idle CPU's runq because it's about to
+     * pick up work from it itself.
+     */
+    if ( peer_pcpu != NULL && !is_idle_vcpu(peer_vcpu) )
+    {
+        // if snext = scurr on local runq is runnable, then add it to candidate vCPUs
+        // more precisely, we should instead compare it to head of global runq, 
+        // to see if one of them have higher priority thus need to run first
+        if ( pri != CSCHED_PRI_IDLE )
+            count++;
+
+        // count all vCPUs of highest priority
+        list_for_each( iter, &peer_pcpu->runq )
+        {
+            speer = __runq_elem(iter);
+            if ( speer->pri <= pri )
+                break;
+
+            /* Is this VCPU runnable on our PCPU? */
+            vc = speer->vcpu;
+            BUG_ON( is_idle_vcpu(vc) );
+
+            if ( balance_step == CSCHED_BALANCE_SOFT_AFFINITY
+                 && !__vcpu_has_soft_affinity(vc, vc->cpu_hard_affinity) )
+                continue;
+
+            csched_balance_cpumask(vc, balance_step, csched_balance_mask(cpu));
+            if ( __csched_vcpu_is_migrateable(vc, cpu,
+                                              csched_balance_mask(cpu)) )
+                // count the number of candidate
+                count++;
+        }
+
+        // if no vCPU to steal
+        if ( count == 0 )
+            return NULL;
+        // otherwise, select random vCPU from candidates
+        else
+            count = get_random() % count;
+
+        list_for_each( iter, &peer_pcpu->runq )
+        {
+            speer = __runq_elem(iter);
+
+            /*
+             * If next available VCPU here is not of strictly higher
+             * priority than ours, this PCPU is useless to us.
+             */
+            if ( speer->pri <= pri )
+                break;
+
+            /* Is this VCPU runnable on our PCPU? */
+            vc = speer->vcpu;
+            BUG_ON( is_idle_vcpu(vc) );
+
+            if ( balance_step == CSCHED_BALANCE_SOFT_AFFINITY
+                 && !__vcpu_has_soft_affinity(vc, vc->cpu_hard_affinity) )
+                continue;
+
+            csched_balance_cpumask(vc, balance_step, csched_balance_mask(cpu));
+            if ( __csched_vcpu_is_migrateable(vc, cpu,
+                                              csched_balance_mask(cpu)) )
+            {
+                if ( count == 0)
+                {
+                    /* We got a candidate. Grab it! */
+                    TRACE_3D(TRC_CSCHED_STOLEN_VCPU, peer_cpu,
+                             vc->domain->domain_id, vc->vcpu_id);
+                    SCHED_VCPU_STAT_CRANK(speer, migrate_q);
+                    SCHED_STAT_CRANK(migrate_queued);
+                    WARN_ON(vc->is_urgent);
+                    __runq_remove(speer);
+                    vc->processor = cpu;
+                    return speer;
+                }
+                else
+                    count--;
+            }
+        }
+
+    }
+
+    SCHED_STAT_CRANK(steal_peer_idle);
+    // return snext_local;
+    return NULL;
+
+}
+
+
+// Li
+// migrate vCPU scurr to another run queue dest_cpu
+static void
+csched_scurr_return(struct csched_private *prv, struct csched_vcpu * const scurr, int dest_cpu)
+{
+    struct vcpu *vc = scurr->vcpu;
+    const struct csched_pcpu * const peer_pcpu = CSCHED_PCPU(dest_cpu);
+    struct cpupool *c = per_cpu(cpupool, vc->processor);
+    cpumask_t workers;
+    cpumask_t *online;
+    online = cpupool_online_cpumask(c);
+    cpumask_andnot(&workers, online, prv->idlers);
+    cpumask_and(&workers, &workers, vc->cpu_hard_affinity);
+
+    if (peer_pcpu != NULL &&
+        !is_idle_vcpu(vc) && __vcpu_on_runq(scurr)
+        && vc->processor != dest_cpu && dest_cpu < nr_cpu_ids )
+    {
+        spinlock_t *lock;
+        int temp = vc->is_running;
+
+        lock = pcpu_schedule_trylock(dest_cpu);
+        if ( !lock )
+            SCHED_STAT_CRANK(steal_trylock_failed);
+        else
+        {
+            // hard affinity (move scurr)
+            vc->is_running = 0;
+            if ( __csched_vcpu_is_migrateable(vc, dest_cpu, &workers) )
+            {
+                __runq_remove(scurr);
+                vc->processor = dest_cpu;
+                __runq_insert(dest_cpu, scurr);
+            }
+            vc->is_running = temp;
+            pcpu_schedule_unlock(lock, dest_cpu);
+        }
+    }
+
+    return;
+}
+
+
+// Li
+// customize csched_load_balance that is used to scan all runnable vCPU in other runq without requiring priority higher than snext
+// only difference is in calling steal function
+static struct csched_vcpu *
+csched_load_balance_custom(struct csched_private *prv, int cpu,
+    struct csched_vcpu *snext, bool_t *stolen)
+{
+    struct cpupool *c = per_cpu(cpupool, cpu);
+    struct csched_vcpu *speer;
+    cpumask_t workers;
+    cpumask_t *online;
+    int peer_cpu, peer_node, bstep;
+    int node = cpu_to_node(cpu);
+
+    BUG_ON( cpu != snext->vcpu->processor );
+    online = cpupool_online_cpumask(c);
+
+    /*
+     * If this CPU is going offline, or is not (yet) part of any cpupool
+     * (as it happens, e.g., during cpu bringup), we shouldn't steal work.
+     */
+    if ( unlikely(!cpumask_test_cpu(cpu, online) || c == NULL) )
+        goto out;
+
+    if ( snext->pri == CSCHED_PRI_IDLE )
+        SCHED_STAT_CRANK(load_balance_idle);
+    else if ( snext->pri == CSCHED_PRI_TS_OVER )
+        SCHED_STAT_CRANK(load_balance_over);
+    else
+        SCHED_STAT_CRANK(load_balance_other);
+
+    /*
+     * Let's look around for work to steal, taking both hard affinity
+     * and soft affinity into account. More specifically, we check all
+     * the non-idle CPUs' runq, looking for:
+     *  1. any "soft-affine work" to steal first,
+     *  2. if not finding anything, any "hard-affine work" to steal.
+     */
+    for_each_csched_balance_step( bstep )
+    {
+        /*
+         * We peek at the non-idling CPUs in a node-wise fashion. In fact,
+         * it is more likely that we find some affine work on our same
+         * node, not to mention that migrating vcpus within the same node
+         * could well expected to be cheaper than across-nodes (memory
+         * stays local, there might be some node-wide cache[s], etc.).
+         */
+        peer_node = node;
+        do
+        {
+            /* Find out what the !idle are in this node */
+            cpumask_andnot(&workers, online, prv->idlers);
+            cpumask_and(&workers, &workers, &node_to_cpumask(peer_node));
+            __cpumask_clear_cpu(cpu, &workers);
+
+            peer_cpu = cpumask_first(&workers);
+            if ( peer_cpu >= nr_cpu_ids )
+                goto next_node;
+            do
+            {
+                /*
+                 * Get ahold of the scheduler lock for this peer CPU.
+                 *
+                 * Note: We don't spin on this lock but simply try it. Spinning
+                 * could cause a deadlock if the peer CPU is also load
+                 * balancing and trying to lock this CPU.
+                 */
+                spinlock_t *lock = pcpu_schedule_trylock(peer_cpu);
+
+                if ( !lock )
+                {
+                    SCHED_STAT_CRANK(steal_trylock_failed);
+                    peer_cpu = cpumask_cycle(peer_cpu, &workers);
+                    continue;
+                }
+
+                // /* Any work over there to steal? */
+                // speer = cpumask_test_cpu(peer_cpu, online) ?
+                //     csched_runq_steal(peer_cpu, cpu, snext->pri, bstep) : NULL;
+                // only difference from original function, allow any runnable vCPU
+                speer = cpumask_test_cpu(peer_cpu, online) ?
+                    csched_runq_steal(peer_cpu, cpu, CSCHED_PRI_IDLE, bstep) : NULL;
+                pcpu_schedule_unlock(lock, peer_cpu);
+
+                /* As soon as one vcpu is found, balancing ends */
+                if ( speer != NULL )
+                {
+                    *stolen = 1;
+                    return speer;
+                }
+
+                peer_cpu = cpumask_cycle(peer_cpu, &workers);
+
+            } while( peer_cpu != cpumask_first(&workers) );
+
+ next_node:
+            peer_node = cycle_node(peer_node, node_online_map);
+        } while( peer_node != node );
+    }
+
+ out:
+    /* Failed to find more important work elsewhere... */
+    __runq_remove(snext);
+    return snext;
+}
+
+// Li
+// used to pick vCPU in random (local/remote) run queue with random (ordered/random) order
+// function switched by option "choose"
+static struct csched_vcpu *
+csched_snext_pick_custom(struct csched_private *prv, int cpu,
+    struct csched_vcpu *snext, bool_t *stolen,
+    int choose
+    )
+{
+    struct list_head * const runq = RUNQ(cpu);
+    struct cpupool *c = per_cpu(cpupool, cpu);
+    struct csched_vcpu *speer;
+    cpumask_t workers;
+    cpumask_t *online;
+    int peer_cpu, bstep;
+    spinlock_t *lock;
+    int pri = (snext->pri == CSCHED_PRI_IDLE) ?
+        CSCHED_PRI_IDLE : snext->pri -1;
+
+    BUG_ON( cpu != snext->vcpu->processor );
+    online = cpupool_online_cpumask(c);
+
+    /*
+     * If this CPU is going offline, or is not (yet) part of any cpupool
+     * (as it happens, e.g., during cpu bringup), we shouldn't steal work.
+     */
+    if ( unlikely(!cpumask_test_cpu(cpu, online) || c == NULL) )
+        goto out_new;
+
+    if ( snext->pri == CSCHED_PRI_IDLE )
+        SCHED_STAT_CRANK(load_balance_idle);
+    else if ( snext->pri == CSCHED_PRI_TS_OVER )
+        SCHED_STAT_CRANK(load_balance_over);
+    else
+        SCHED_STAT_CRANK(load_balance_other);
+
+    cpumask_andnot(&workers, online, prv->idlers);
+
+    // choose the runq
+    // of current current
+    if ( choose == 2 )
+        peer_cpu = cpu;
+    // of global runq
+    else if ( choose == 4 || choose == 5 )
+        peer_cpu = 0;
+    // of random runq
+    else if ( choose == 1 || choose == 3 )
+        peer_cpu = cpumask_any(&workers);
+
+    // no suitable runq
+    if ( peer_cpu >= nr_cpu_ids )
+        goto out_new;
+    // if local runq is chosen
+    else if ( peer_cpu == cpu )
+    {
+        // pick random vCPU from local runq
+        if ( choose == 2 || choose == 3 || choose == 5 )
+            snext = csched_snext_pick_local_random( runq );
+        // else, the first vCPU form local runq
+        goto out_new;
+    }
+    // if remote runq is chosen
+    else
+    {
+        for_each_csched_balance_step( bstep )
+        {
+            lock = pcpu_schedule_trylock(peer_cpu);
+
+            if ( !lock )
+            {
+                SCHED_STAT_CRANK(steal_trylock_failed);
+                continue;
+            }
+            // pick vCPU in order
+            if ( choose == 1 || choose == 4 )
+                speer = cpumask_test_cpu(peer_cpu, online) ?
+                    csched_runq_steal_order(peer_cpu, cpu, pri, bstep) : NULL;
+            // pick vCPU in random
+            else if ( choose == 2 || choose == 3 || choose == 5 )
+                speer = cpumask_test_cpu(peer_cpu, online) ?
+                    csched_runq_steal_random(peer_cpu, cpu, pri, bstep) : NULL;
+
+            pcpu_schedule_unlock(lock, peer_cpu);
+
+            // a vCPU of equal/higher priority of snext found in chosen runq
+            if ( speer != NULL )
+            {
+                *stolen = 1;
+                return speer;
+            }
+            // else, x1. go to out_new to use snext, or do load balance
+            // with this design, snext is slightly more likely to come from local runq than remote runq, save more context switches
+            // 2. or 50% skip local runq, starting from next runq
+            if ( get_random() % 2 == 0 )
+            {
+                snext = csched_load_balance_custom(prv, cpu, snext, stolen);
+                return snext;
+            }
+        }
+    }
+
+ out_new:
+    /* Check if load_balance is needed*/
+    if ( snext->pri > CSCHED_PRI_TS_OVER )
+        __runq_remove(snext);
+    else
+        snext = csched_load_balance(prv, cpu, snext, stolen);
+    return snext;
+}
+
 /*
  * This function is in the critical path. It is designed to be simple and
  * fast for the common case.
@@ -1628,6 +2097,22 @@ csched_schedule(
     struct csched_vcpu *snext;
     struct task_slice ret;
     s_time_t runtime, tslice;
+
+    // Li
+    // define an option to switch between different version of improved scheduler
+    // difference mainly in vCPU picking up and returning process
+    // A: which runq to pick next vCPU (local/random/global)
+    // B: which order to pick next vCPU in given runq (ordered/random)
+    // C: which runq to return current vCPU (local/global)
+    // the combinations of different value for choose are:
+    //  choose=1: A-random, B-order, C-local
+    //        =2: A-local, B-random, C-local
+    //        =3: A-random, B-random, C-local
+    //        =4: A-global, B-order, C-global
+    //        =5: A-global, B-random, C-global
+    // LCS in paper using choose=3, GCS using choose=5
+    int choose           = 5;
+    int dest_cpu = cpu;
 
     SCHED_STAT_CRANK(schedule);
     CSCHED_VCPU_CHECK(current);
@@ -1709,10 +2194,27 @@ csched_schedule(
      * urgent work... If not, csched_load_balance() will return snext, but
      * already removed from the runq.
      */
-    if ( snext->pri > CSCHED_PRI_TS_OVER )
-        __runq_remove(snext);
-    else
-        snext = csched_load_balance(prv, cpu, snext, &ret.migrated);
+     /* if ( snext->pri > CSCHED_PRI_TS_OVER ) */
+     /*     __runq_remove(snext); */
+     /* else */
+     /*     snext = csched_load_balance(prv, cpu, snext, &ret.migrated); */
+
+    ////////////////////////////////////////////////////////
+    // add for new schedulers
+
+    // combine local runq/global runq schedulers
+    // pick one of highest priority in chosen runq
+    snext = csched_snext_pick_custom(prv, cpu, snext, &ret.migrated, choose);
+
+    // return vCPU to global runq of pcpu=0
+    if ( choose == 4 || choose == 5)
+    {
+        dest_cpu = 0;
+        if ( dest_cpu != cpu && scurr != snext && !is_idle_vcpu(scurr->vcpu))
+            csched_scurr_return(prv, scurr, dest_cpu);
+    }
+    ///////////////////////////////////////////////////////
+
 
     /*
      * Update idlers mask if necessary. When we're idling, other CPUs
@@ -1981,7 +2483,7 @@ static void csched_tick_resume(const struct scheduler *ops, unsigned int cpu)
 static struct csched_private _csched_priv;
 
 const struct scheduler sched_credit_def = {
-    .name           = "SMP Credit Scheduler",
+    .name           = "SMP Credit Scheduler GCS",
     .opt_name       = "credit",
     .sched_id       = XEN_SCHEDULER_CREDIT,
     .sched_data     = &_csched_priv,
