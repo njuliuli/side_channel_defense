@@ -1,6 +1,8 @@
 # side_channel_defense
 
-improve credit scheduler to defend against side channel attack
+An improve credit scheduler to defend against side channel attack
+
+Refer to http://www.cs.gmu.edu/~sqchen/open-access/new-scheduler-report.pdf
 
 ## how to use
 
