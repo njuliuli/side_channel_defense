@@ -2,7 +2,8 @@
 
 An improve credit scheduler to defend against side channel attack
 
-Refer to [the new scheduler report](http://www.cs.gmu.edu/~sqchen/open-access/new-scheduler-report.pdf)
+Refer to [the new scheduler report](http://www.cs.gmu.edu/~sqchen/open-access/new-xen-scheduler-report.pdf)
+
 
 ## how to use
 
