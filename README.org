@@ -1,24 +1,38 @@
-* this is a test
+* abstract
 
-** this is another test
+Cloud computing relies on resources sharing to achieve high resource utilization and economy of scale.
+Meanwhile,
+contention on shared resources open doors for co-located VMs to have negative impacts on each other,
+and even introduces vulnerabilities such as information leakage.
+Via CPU cache based side channel attacks,
+an attacking Virtual Machine (VM) can extract crypto keys from a targeted VM.
 
-# side_channel_defense
+To cost-effectively secure the cloud against those threats without sacrificing resource sharing,
+in our paper 
+(http://www.cs.gmu.edu/~sqchen/open-access/new-xen-scheduler-report.pdf),
+we first investigate the factors that can impact the success of such attacks.
+Our investigation reveals that
+the root cause of such attacks is the constant sharing patterns of hardware resources between VMs.
+Based on our findings,
+we quantify the negative impacts a VM can have on another VM
+on the same machine using /vulnerable probability/,
+and propose lightweight and generic scheduler-based defense mechanisms called /Shuffling schedulers/,
+which can effectively limit the vulnerable probability of any VM.
+Our analyses and experimental results show that Shuffling schedulers
+can effectively reduce information leakage to mitigate cross-VM attacks
+with little performance penalty while preserving high resource utilization. 
 
-An improve credit scheduler to defend against side channel attack
 
-Refer to [the new scheduler report](http://www.cs.gmu.edu/~sqchen/open-access/new-xen-scheduler-report.pdf)
-
-
-## how to use
+* code summary
 
 The directory "/xen" contains source code of xen-4.6.0, cloned by "git clone -b RELEASE-4.6.0 git://xenbits.xen.org/xen.git". 
 
 The file /xen/xen/common/sched\_credit.c is modified to improve credit scheduler to defend against side channel attacks.
-
-The different version of improved schedulers can be switched to by chaning the value of "choose" in this file, in the function "csched\_schedule". 
+g
+The different version of Shuffling schedulers can be switched to by chaning the value of "choose" in this file, in the function "csched_schedule".
 A summary of how each scheduler behave is described in line 2101-2113 of this file.
 
-```C
+#+BEGIN_SRC c
 
     // Li
     // define an option to switch between different version of improved scheduler
@@ -32,10 +46,10 @@ A summary of how each scheduler behave is described in line 2101-2113 of this fi
     //        =3: A-random, B-random, C-local
     //        =4: A-global, B-order, C-global
     //        =5: A-global, B-random, C-global
-    // LCS in paper using choose=3, GCS using choose=5
+    // LS in paper using choose=3, GS using choose=5
     int choose           = 5;
 
-```
+#+END_SRC
 
 After set the value of "choose", xen can be build and install as normal.
 A good guide to compile Xen from source: https://wiki.xenproject.org/wiki/Compiling_Xen_From_Source
